@@ -1,15 +1,15 @@
-FROM docker.io/library/python:3.12-slim AS builder
+FROM docker.io/library/python:3.11 AS builder
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt -t /deps
+RUN pip install --no-cache-dir -r requirements.txt
 
 FROM docker.io/redhat/ubi9:latest
-RUN dnf install -y python3.12 python3.12-pip && dnf clean all
+RUN dnf install -y python3 python3-pip && dnf clean all
+ENV INSTANA_SERVICE_NAME=payment
 WORKDIR /app
-COPY --from=builder /deps /app/deps
-ENV PYTHONPATH=/app/deps
-COPY main.py .
-COPY run.sh /run.sh
-RUN chmod +x /run.sh
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt
+COPY *.py ./
+COPY payment.ini ./
 EXPOSE 8080
-ENTRYPOINT ["bash", "/run.sh"]
+CMD ["uwsgi", "--ini", "payment.ini"]
