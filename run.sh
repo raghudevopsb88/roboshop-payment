@@ -8,11 +8,18 @@ if [ -f /data/params ]; then
     set +a
 fi
 
-export AMQP_HOST="${AMQP_HOST:-rabbitmq}"
-export AMQP_USER="${AMQP_USER:-guest}"
-export AMQP_PASS="${AMQP_PASS:-guest}"
-export CART_URL="${CART_URL:-http://${CART_HOST:-roboshop-cart}:${CART_PORT:-8080}}"
-export USER_URL="${USER_URL:-http://${USER_HOST:-roboshop-user}:${USER_PORT:-8080}}"
-export PORT="${SHOP_PAYMENT_PORT:-8080}"
+: "${AMQP_HOST:?AMQP_HOST is required}"
+: "${AMQP_USER:?AMQP_USER is required}"
+: "${AMQP_PASS:?AMQP_PASS is required}"
+: "${CART_HOST:?CART_HOST is required}"
+: "${CART_PORT:?CART_PORT is required}"
+: "${USER_HOST:?USER_HOST is required}"
+: "${USER_PORT:?USER_PORT is required}"
+: "${SHOP_PAYMENT_PORT:?SHOP_PAYMENT_PORT is required}"
+
+export AMQP_HOST AMQP_USER AMQP_PASS
+export CART_URL="http://${CART_HOST}:${CART_PORT}"
+export USER_URL="http://${USER_HOST}:${USER_PORT}"
+export PORT="${SHOP_PAYMENT_PORT}"
 
 exec uvicorn main:app --host 0.0.0.0 --port "$PORT"
