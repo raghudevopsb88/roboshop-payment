@@ -22,4 +22,4 @@ export CART_URL="http://${CART_HOST}:${CART_PORT}"
 export USER_URL="http://${USER_HOST}:${USER_PORT}"
 export PORT="${SHOP_PAYMENT_PORT}"
 
-exec uvicorn main:app --host 0.0.0.0 --port "$PORT"
+exec python3.12 -m uvicorn main:app --host 0.0.0.0 --port "$PORT"
