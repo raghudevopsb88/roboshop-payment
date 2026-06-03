@@ -1,29 +1,33 @@
-import os
+import asyncio
 import json
-import uuid
-import time
 import logging
-import pika
+import os
+import time
+import uuid
+from contextlib import asynccontextmanager
+
 import httpx
+import pika
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("payment")
 
-app = FastAPI(title="RoboShop Payment Service")
-
 AMQP_HOST = os.getenv("AMQP_HOST", "rabbitmq")
 AMQP_USER = os.getenv("AMQP_USER", "guest")
 AMQP_PASS = os.getenv("AMQP_PASS", "guest")
 CART_URL = os.getenv("CART_URL", "http://cart:8003")
 USER_URL = os.getenv("USER_URL", "http://user:8001")
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
+HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "3"))
 
 EXCHANGE = "roboshop"
 ROUTING_KEY = "orders"
 
 rabbitmq_connection = None
 rabbitmq_channel = None
+http_client: httpx.AsyncClient | None = None
 
 
 def connect_rabbitmq():
@@ -41,9 +45,45 @@ def connect_rabbitmq():
             logger.info("Connected to RabbitMQ")
             return
         except Exception as e:
-            logger.warning(f"RabbitMQ connection attempt {i+1}/30 failed: {e}")
+            logger.warning("RabbitMQ connection attempt %s/30 failed: %s", i + 1, e)
             time.sleep(2)
     raise Exception("Failed to connect to RabbitMQ")
+
+
+def publish_order_event(order_event: dict) -> None:
+    body = json.dumps(order_event)
+    props = pika.BasicProperties(delivery_mode=2)
+    try:
+        rabbitmq_channel.basic_publish(
+            exchange=EXCHANGE,
+            routing_key=ROUTING_KEY,
+            body=body,
+            properties=props,
+        )
+    except Exception as e:
+        logger.error("Failed to publish order event: %s", e)
+        connect_rabbitmq()
+        rabbitmq_channel.basic_publish(
+            exchange=EXCHANGE,
+            routing_key=ROUTING_KEY,
+            body=body,
+            properties=props,
+        )
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global http_client
+    connect_rabbitmq()
+    timeout = httpx.Timeout(HTTP_TIMEOUT, connect=10.0)
+    limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
+    http_client = httpx.AsyncClient(timeout=timeout, limits=limits)
+    logger.info("Payment service ready (http_timeout=%ss, retries=%s)", HTTP_TIMEOUT, HTTP_RETRIES)
+    yield
+    await http_client.aclose()
+
+
+app = FastAPI(title="RoboShop Payment Service", lifespan=lifespan)
 
 
 class PaymentRequest(BaseModel):
@@ -51,9 +91,25 @@ class PaymentRequest(BaseModel):
     cityId: int
 
 
-@app.on_event("startup")
-async def startup():
-    connect_rabbitmq()
+async def request_upstream(method: str, url: str, service_name: str) -> httpx.Response:
+    last_err: Exception | None = None
+    for attempt in range(HTTP_RETRIES):
+        try:
+            return await http_client.request(method, url)
+        except httpx.RequestError as e:
+            last_err = e
+            logger.warning(
+                "%s %s attempt %s/%s failed: %s",
+                method,
+                url,
+                attempt + 1,
+                HTTP_RETRIES,
+                e,
+            )
+            if attempt < HTTP_RETRIES - 1:
+                await asyncio.sleep(0.15 * (attempt + 1))
+    logger.error("%s service unavailable after %s attempts: %s", service_name, HTTP_RETRIES, last_err)
+    raise HTTPException(status_code=503, detail=f"{service_name} service unavailable")
 
 
 @app.get("/health")
@@ -63,33 +119,27 @@ def health():
 
 @app.post("/payment/process")
 async def process_payment(request: PaymentRequest):
-    # Validate user
-    async with httpx.AsyncClient() as client:
-        try:
-            user_resp = await client.get(f"{USER_URL}/validate/{request.userId}")
-            if user_resp.status_code != 200:
-                raise HTTPException(status_code=400, detail="Invalid user")
-            user = user_resp.json()
-        except httpx.RequestError:
-            raise HTTPException(status_code=503, detail="User service unavailable")
+    logger.info(">> POST /payment/process userId=%s cityId=%s", request.userId, request.cityId)
 
-        # Get cart
-        try:
-            cart_resp = await client.get(f"{CART_URL}/cart/{request.userId}")
-            if cart_resp.status_code != 200:
-                raise HTTPException(status_code=400, detail="Failed to get cart")
-            cart = cart_resp.json()
-        except httpx.RequestError:
-            raise HTTPException(status_code=503, detail="Cart service unavailable")
+    user_resp = await request_upstream("GET", f"{USER_URL}/validate/{request.userId}", "User")
+    if user_resp.status_code != 200:
+        logger.warning("Invalid user %s (status %s)", request.userId, user_resp.status_code)
+        raise HTTPException(status_code=400, detail="Invalid user")
+    user = user_resp.json()
+
+    cart_resp = await request_upstream("GET", f"{CART_URL}/cart/{request.userId}", "Cart")
+    if cart_resp.status_code != 200:
+        logger.warning("Failed to get cart for %s (status %s)", request.userId, cart_resp.status_code)
+        raise HTTPException(status_code=400, detail="Failed to get cart")
+    cart = cart_resp.json()
 
     if not cart.get("items"):
+        logger.warning("Cart empty for user %s", request.userId)
         raise HTTPException(status_code=400, detail="Cart is empty")
 
-    # Mock payment processing
     total = sum(item["price"] * item["quantity"] for item in cart["items"])
     transaction_id = f"TXN-{uuid.uuid4().hex[:8].upper()}"
 
-    # Build order event
     order_event = {
         "userId": request.userId,
         "userEmail": user.get("email", ""),
@@ -101,31 +151,14 @@ async def process_payment(request: PaymentRequest):
         "status": "PAID",
     }
 
-    # Publish to RabbitMQ
-    try:
-        rabbitmq_channel.basic_publish(
-            exchange=EXCHANGE,
-            routing_key=ROUTING_KEY,
-            body=json.dumps(order_event),
-            properties=pika.BasicProperties(delivery_mode=2),
-        )
-        logger.info(f"Payment processed: {transaction_id} for user {request.userId}")
-    except Exception as e:
-        logger.error(f"Failed to publish order event: {e}")
-        connect_rabbitmq()
-        rabbitmq_channel.basic_publish(
-            exchange=EXCHANGE,
-            routing_key=ROUTING_KEY,
-            body=json.dumps(order_event),
-            properties=pika.BasicProperties(delivery_mode=2),
-        )
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, publish_order_event, order_event)
+    logger.info("Payment processed: %s for user %s", transaction_id, request.userId)
 
-    # Clear cart after payment
-    async with httpx.AsyncClient() as client:
-        try:
-            await client.delete(f"{CART_URL}/cart/{request.userId}")
-        except Exception:
-            logger.warning("Failed to clear cart after payment")
+    try:
+        await http_client.delete(f"{CART_URL}/cart/{request.userId}")
+    except httpx.RequestError:
+        logger.warning("Failed to clear cart after payment for user %s", request.userId)
 
     return {
         "status": "SUCCESS",
