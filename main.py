@@ -2,12 +2,12 @@ import asyncio
 import json
 import logging
 import os
-import time
 import uuid
 from contextlib import asynccontextmanager
 
+import aio_pika
 import httpx
-import pika
+from aio_pika import DeliveryMode, ExchangeType
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -25,62 +25,62 @@ HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "3"))
 EXCHANGE = "roboshop"
 ROUTING_KEY = "orders"
 
-rabbitmq_connection = None
-rabbitmq_channel = None
+rabbit_connection: aio_pika.RobustConnection | None = None
+rabbit_exchange: aio_pika.Exchange | None = None
 http_client: httpx.AsyncClient | None = None
 
 
-def connect_rabbitmq():
-    global rabbitmq_connection, rabbitmq_channel
-    credentials = pika.PlainCredentials(AMQP_USER, AMQP_PASS)
-    for i in range(30):
+async def setup_rabbitmq() -> None:
+    global rabbit_connection, rabbit_exchange
+    for attempt in range(30):
         try:
-            rabbitmq_connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=AMQP_HOST, credentials=credentials)
+            rabbit_connection = await aio_pika.connect_robust(
+                host=AMQP_HOST,
+                port=5672,
+                login=AMQP_USER,
+                password=AMQP_PASS,
             )
-            rabbitmq_channel = rabbitmq_connection.channel()
-            rabbitmq_channel.exchange_declare(exchange=EXCHANGE, exchange_type="direct", durable=True)
-            rabbitmq_channel.queue_declare(queue="orders", durable=True)
-            rabbitmq_channel.queue_bind(queue="orders", exchange=EXCHANGE, routing_key=ROUTING_KEY)
-            logger.info("Connected to RabbitMQ")
+            channel = await rabbit_connection.channel()
+            rabbit_exchange = await channel.declare_exchange(
+                EXCHANGE, ExchangeType.DIRECT, durable=True
+            )
+            queue = await channel.declare_queue("orders", durable=True)
+            await queue.bind(rabbit_exchange, routing_key=ROUTING_KEY)
+            logger.info("Connected to RabbitMQ at %s", AMQP_HOST)
             return
-        except Exception as e:
-            logger.warning("RabbitMQ connection attempt %s/30 failed: %s", i + 1, e)
-            time.sleep(2)
-    raise Exception("Failed to connect to RabbitMQ")
+        except Exception as exc:
+            logger.warning(
+                "RabbitMQ connection attempt %s/30 failed: %s", attempt + 1, exc
+            )
+            rabbit_connection = None
+            rabbit_exchange = None
+            await asyncio.sleep(2)
+    raise RuntimeError("Failed to connect to RabbitMQ")
 
 
-def publish_order_event(order_event: dict) -> None:
-    body = json.dumps(order_event)
-    props = pika.BasicProperties(delivery_mode=2)
-    try:
-        rabbitmq_channel.basic_publish(
-            exchange=EXCHANGE,
-            routing_key=ROUTING_KEY,
-            body=body,
-            properties=props,
-        )
-    except Exception as e:
-        logger.error("Failed to publish order event: %s", e)
-        connect_rabbitmq()
-        rabbitmq_channel.basic_publish(
-            exchange=EXCHANGE,
-            routing_key=ROUTING_KEY,
-            body=body,
-            properties=props,
-        )
+async def publish_order_event(order_event: dict) -> None:
+    if rabbit_exchange is None:
+        raise RuntimeError("RabbitMQ exchange not initialized")
+
+    body = json.dumps(order_event).encode()
+    await rabbit_exchange.publish(
+        aio_pika.Message(body=body, delivery_mode=DeliveryMode.PERSISTENT),
+        routing_key=ROUTING_KEY,
+    )
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global http_client
-    connect_rabbitmq()
+    await setup_rabbitmq()
     timeout = httpx.Timeout(HTTP_TIMEOUT, connect=10.0)
     limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
     http_client = httpx.AsyncClient(timeout=timeout, limits=limits)
     logger.info("Payment service ready (http_timeout=%ss, retries=%s)", HTTP_TIMEOUT, HTTP_RETRIES)
     yield
     await http_client.aclose()
+    if rabbit_connection is not None:
+        await rabbit_connection.close()
 
 
 app = FastAPI(title="RoboShop Payment Service", lifespan=lifespan)
@@ -151,8 +151,12 @@ async def process_payment(request: PaymentRequest):
         "status": "PAID",
     }
 
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, publish_order_event, order_event)
+    try:
+        await publish_order_event(order_event)
+    except Exception as exc:
+        logger.error("Failed to publish order event: %s", exc)
+        raise HTTPException(status_code=503, detail="Message broker unavailable") from exc
+
     logger.info("Payment processed: %s for user %s", transaction_id, request.userId)
 
     try:
