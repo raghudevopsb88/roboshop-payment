@@ -11,4 +11,4 @@ eks-deploy:
 
 argocd-deploy:
 	argocd login $(argocd_server) --skip-test-tls --username admin --password $(argocd_admin_password)
-	argocd app create roboshop-payment --sync-policy auto --upsert --repo https://github.com/raghudevopsb88/wmp-helm-v2.git --path . --dest-server https://kubernetes.default.svc --dest-namespace default --helm-set-string image_tag=$(image_tag) --values values/roboshop-payment.yml
+	argocd app create roboshop-payment --sync-policy auto --upsert --repo https://github.com/raghudevopsb88/roboshop-helm-v1.git --path . --dest-server https://kubernetes.default.svc --dest-namespace default --helm-set-string image_tag=$(image_tag) --values values/roboshop-payment.yml
