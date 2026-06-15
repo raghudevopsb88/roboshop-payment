@@ -4,7 +4,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt -t /deps
 
 FROM docker.io/redhat/ubi9:latest
-RUN dnf install -y python3.12 python3.12-pip && dnf clean all
+RUN dnf install -y python3.12 python3.12-pip \
+    && dnf update -y \
+    && dnf clean all
 WORKDIR /app
 COPY --from=builder /deps /app/deps
 ENV PYTHONPATH=/app/deps
